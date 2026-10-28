@@ -153,7 +153,7 @@ class CoalescingEmbeddingModel:
                 result = await self._model.embed_query(texts)
             else:
                 result = await self._model.embed(texts)
-            _validate_vectors(result, count=len(texts), dimension=self.profile.dimension)
+            _validate_vector_count(result, count=len(texts))
             self._sequence += 1
             usage = _BatchUsage(
                 sequence=self._sequence,
@@ -186,15 +186,16 @@ def _observe_failure(future: asyncio.Future[_Completed]) -> None:
 
 
 def _sum_tokens(values: tuple[int | None, ...]) -> int | None:
-    known = tuple(value for value in values if value is not None)
-    return sum(known) if known else None
+    # A partial provider count is not a complete total. Match the Runtime's
+    # portable usage aggregation instead of silently interpreting unknown as zero.
+    if not values or any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
 
 
-def _validate_vectors(result: EmbeddingResult, *, count: int, dimension: int) -> None:
+def _validate_vector_count(result: EmbeddingResult, *, count: int) -> None:
     if len(result.vectors) != count:
         raise ValueError("provider vector count does not match the batch")  # noqa: TRY003
-    if any(len(vector) != dimension or any(not math.isfinite(value) for value in vector) for vector in result.vectors):
-        raise ValueError("provider vectors must be finite and match the profile")  # noqa: TRY003
 
 
 __all__ = ["CoalescingEmbeddingModel"]

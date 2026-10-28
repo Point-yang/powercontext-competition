@@ -18,9 +18,11 @@ import asyncio
 
 import pytest
 
-from powercontext.builtin.artifacts.memory import EmbeddingProfile
+from powercontext.builtin.artifacts.memory import EmbeddingProfile, MemoryEntryInput
 from powercontext.builtin.inference import EmbeddingResult, InferenceUsage
 from powercontext.builtin.inference.coalescing import CoalescingEmbeddingModel
+from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
 
 
 class _Provider:
@@ -101,6 +103,26 @@ async def test_usage_sums_each_waited_batch_once_and_detaches_mutable_results() 
 
 
 @pytest.mark.anyio
+async def test_usage_preserves_unknown_provider_token_counts_instead_of_publishing_a_partial_total() -> None:
+    class PartiallyMetered(_Provider):
+        async def embed(self, texts: tuple[str, ...]) -> EmbeddingResult:
+            return EmbeddingResult(
+                vectors=tuple((1.0,) for _ in texts),
+                usage=InferenceUsage(
+                    requests=2,
+                    input_tokens=7 if texts == ("known",) else None,
+                    output_tokens=0,
+                ),
+            )
+
+    model = CoalescingEmbeddingModel(PartiallyMetered(), max_batch_size=1, coalesce_ms=0)
+    result = await model.embed(("known", "unknown", "known"))
+    assert result.usage == InferenceUsage(requests=4, input_tokens=None, output_tokens=0)
+    assert (await model.embed(("known", "unknown"))).usage == InferenceUsage(requests=0)
+    assert (await model.embed(())).usage == InferenceUsage(requests=0)
+
+
+@pytest.mark.anyio
 async def test_asymmetric_query_and_document_vectors_do_not_share_cache() -> None:
     class Asymmetric(_Provider):
         async def embed_query(self, texts: tuple[str, ...]) -> EmbeddingResult:
@@ -115,7 +137,7 @@ async def test_asymmetric_query_and_document_vectors_do_not_share_cache() -> Non
     assert len(provider.calls) == 2
 
 
-@pytest.mark.parametrize("vectors", [(), ((1.0,), (2.0,)), ((1.0, 2.0),), ((float("nan"),),)])
+@pytest.mark.parametrize("vectors", [(), ((1.0,), (2.0,))])
 @pytest.mark.anyio
 async def test_invalid_provider_results_can_be_retried_without_cache_pollution(vectors) -> None:
     class InvalidOnce(_Provider):
@@ -129,6 +151,42 @@ async def test_invalid_provider_results_can_be_retried_without_cache_pollution(v
         await model.embed(("text",))
     assert (await model.embed(("text",))).vectors == ((1.0,),)
     assert len(provider.calls) == 2
+
+
+@pytest.mark.anyio
+async def test_wrapper_preserves_successful_provider_vectors_without_reinterpreting_the_profile() -> None:
+    class ProviderManaged(_Provider):
+        # The wrapper coordinates requests. Dimension enforcement belongs to the
+        # Memory/index boundary, not to the provider's generic batch result.
+        profile = EmbeddingProfile(profile_id="provider-managed", model="offline", dimension=3)
+
+    provider = ProviderManaged()
+    model = CoalescingEmbeddingModel(provider, coalesce_ms=0)
+    first = await model.embed(("four", "eight", "four"))
+    assert first.vectors == ((4.0,), (5.0,), (4.0,))
+    assert model.profile is provider.profile
+    cached = await model.embed(("eight", "four"))
+    assert cached.vectors == ((5.0,), (4.0,))
+    assert cached.usage.requests == 0
+    assert provider.calls == [("four", "eight")]
+
+
+@pytest.mark.parametrize("vector", [(1.0, 2.0), (float("nan"),)])
+@pytest.mark.anyio
+async def test_native_memory_keeps_dimension_and_finite_validation_at_its_own_boundary(vector) -> None:
+    class InvalidCoordinates(_Provider):
+        async def embed(self, texts: tuple[str, ...]) -> EmbeddingResult:
+            return EmbeddingResult(vectors=tuple(vector for _ in texts))
+
+    model = CoalescingEmbeddingModel(InvalidCoordinates(), coalesce_ms=0)
+    async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig()), embedding_model=model) as contexts:
+        service = (await contexts.get("invalid-embedding-coordinates")).artifacts.memory
+        with pytest.raises(ValueError, match=r"embedding must contain exactly|embedding values must all be finite"):
+            await service.remember(
+                memory=None,
+                entries=(MemoryEntryInput(kind="fact", text="Memory enforces its vector profile."),),
+                mode="append",
+            )
 
 
 @pytest.mark.parametrize(
