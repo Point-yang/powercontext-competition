@@ -24,17 +24,25 @@ Commit ID：该分支已上传版本的完整 40 位 SHA
 | --- | --- | --- | --- |
 | 一 准备参赛仓库 | `chore/repository-setup` | `dab240063bfcfa7917898dc44da4baadb3747bd0` | 已通过（参赛者确认） |
 | 二 CSV 行级采集 | `feat/csv-row-source` | `d78a4cfb78d67ed6686b83bd104790c50132fde7` | 已通过（参赛者确认） |
-| 三 Pi 会话历史 | `feat/pi-history` | `784d33e8a57461e77eb9e09b2221850673c75cf6` | 公开自测通过 |
-| 四 PDF 全文与证据页检索 | `feat/pdf-retrieval` | `8c2d4e4ed315efa59945c6a016445aa42c4bde42` | 公开自测通过 |
-| 五 HTTP 重排 | `feat/http-reranking` | `5f69b92cccf85939935b2430aa09c53e99b30feb` | 公开自测通过 |
-| 六 上下文增量传输 | `feat/incremental-context` | `e8234b9662cd580815c702cc7d63b6b4b66221eb` | 公开自测通过 |
-| 七 来源数量触发 | `feat/count-trigger` | `8bed194fc220b2c3c44f1655b240ad9da53024fb` | 公开自测通过 |
-| 八 Embedding 并发合并 | `feat/embedding-batches` | `74f9144ec375c642b207535b86214efad5b99eed` | 公开自测通过 |
-| 九 来源生命周期 | `feat/source-lifecycle` | `c284088bf0329d62007ba35c0bb78fa1160ee4bc` | 公开自测通过 |
-| 十 查询驱动原文选择 | `feat/evidence-selection` | `0973a8c536d9cffbde1b1ca899469714d5da076b` | 公开自测通过 |
-| 十一 原生单 SQL 混合检索 | `perf/hybrid-search` | `a6258f0f0b119c43fb10bc7717788bfcd74c3025` | 指定 seekdb 版本原生自测通过 |
+| 三 Pi 会话历史 | `feat/pi-history` | `784d33e8a57461e77eb9e09b2221850673c75cf6` | 正式提测已得分（参赛者截图） |
+| 四 PDF 全文与证据页检索 | `fix/pdf-document-recall` | `51b710b35a5bd066eeaa86b4d7b0045b11a7cef7` | 复现问题已修复，待正式重提 |
+| 五 HTTP 重排 | `feat/http-reranking` | `5f69b92cccf85939935b2430aa09c53e99b30feb` | 正式提测已得分（参赛者截图） |
+| 六 上下文增量传输 | `feat/incremental-context` | `e8234b9662cd580815c702cc7d63b6b4b66221eb` | 正式提测已得分（参赛者截图） |
+| 七 来源数量触发 | `feat/count-trigger` | `8bed194fc220b2c3c44f1655b240ad9da53024fb` | 正式提测已得分（参赛者截图） |
+| 八 Embedding 并发合并 | `fix/embedding-usage` | `047ffaff478268cb73b1b8ea510f4c3990b4005a` | 协议问题已修复，待正式重提 |
+| 九 来源生命周期 | `feat/source-lifecycle` | `c284088bf0329d62007ba35c0bb78fa1160ee4bc` | 正式提测已得分（参赛者截图） |
+| 十 查询驱动原文选择 | `feat/evidence-selection` | `0973a8c536d9cffbde1b1ca899469714d5da076b` | 正式提测已得分（参赛者截图） |
+| 十一 原生单 SQL 混合检索 | `perf/hybrid-search` | `a6258f0f0b119c43fb10bc7717788bfcd74c3025` | 正式记录零分，需提测版本及失败日志核对 |
 
 各分支从已有累计版本继续开发，因此可以同时包含其他已完成题目。`baseline/2026-competition` 固定保留公开比赛起点 `dab240063bfcfa7917898dc44da4baadb3747bd0`；官方冻结产品基线 `9db1753434162c0aa7c9f1189a1722e617880a52` 保留在历史中。`main` 仅保留最初初始化提交，不作为代码提测版本。
+
+## 正式反馈与复核状态
+
+参赛者提供的分题结果中，第一、二、三、五、六、七、九、十题已得分，第四、八、十一题为零分，详情列未提供错误。该记录的完整 Commit ID 尚待核对；不能仅据本地测试通过认定正式要求全部满足。
+
+- 第四题已用真实 PDF 解析和 SQLite 持久化复现：多份财报中，指定发行人的长页面被其他公司的短页挤出。修复统一查询与排序分词、保留字母数字混合的发行人名称、使用文档名识别问题指定发行人，并按实际 active Memory 数量确定候选池。候选仍来自公开 `Memory.search`，引用仍通过 `Memory.get` 精确读取；没有更改解析页原文或读取答案、标注证据。
+- 第八题已复现两个协议问题：包装器对 provider 成功返回的向量增加了数量以外的坐标限制；部分批次 token 用量未知时错误返回已知部分之和。现仅在包装器核对向量数量，真实 Memory 的维度和有限数校验保留；用量有未知项时汇总保持未知。
+- 第十一题未修改实现，也未确定正式失败原因。指定版本原生环境中扩大到 173 篇自建文档、384 维单位向量、三个 scope、20 条自建查询，共 60 次完整检索；候选及自建相关性指标与冻结路径一致，候选 SQL 次数为一，p50 为 66.06 ms，最大为 254.32 ms。这些数据不能代替未发布语料的正式质量验收。应核对提测是否包含 `a6258f0f0b119c43fb10bc7717788bfcd74c3025` 的单 SQL 实现及平台具体失败阶段。
 
 ## 后续题目实现
 
@@ -65,7 +73,7 @@ DOCKER_DEFAULT_PLATFORM=linux/amd64 POWERCONTEXT_CANDIDATE="$PWD" \
   selftest make -C /selftest test PYTHON=python PRODUCT=/candidate
 ```
 
-本次整合版本在该环境完整运行通过下表 95 项官方公开测试。该环境使用 Python 3.12、官方固定依赖、`pylibseekdb==1.3.0.post4`，离线运行，限制 1 CPU／2 GiB，产品源码和官方资产只读。在 Mac ARM 主机通过 AMD64 仿真运行时，不用仿真延迟声称正式平台性能达标。
+累计基线 `59599db4c01f75a37503105d3ca665e96be057ca` 在该环境完整通过下表 95 项官方公开测试；修复版本再次运行 PDF、Embedding 与原生混合检索，共 15 项全部通过。该环境使用 Python 3.12、官方固定依赖、`pylibseekdb==1.3.0.post4`，离线运行，限制 1 CPU／2 GiB，产品源码和官方资产只读。在 Mac ARM 主机通过 AMD64 仿真运行时，不用仿真延迟声称正式平台性能达标。
 
 | 公开题目测试 | 用例数 |
 | --- | ---: |
@@ -81,7 +89,7 @@ DOCKER_DEFAULT_PLATFORM=linux/amd64 POWERCONTEXT_CANDIDATE="$PWD" \
 | 原生混合检索 | 1 |
 | 合计 | 95 |
 
-核心产品整合回归 296 项通过。新增产品回归在 `tests/`，包括真实 SQLite 持久化、后台任务恢复、Unicode 和协议边界、跨 scope 引用、取消与失败恢复。额外原生回归验证稀疏标签、空结果、当前身份及两类索引计划；384 维、三个 scope 的 36 次合成对照中，两通道候选排序与冻结双查询路径一致。
+当前核心产品整合回归 299 项通过。新增产品回归在 `tests/`，包括真实 SQLite 持久化、后台任务恢复、Unicode 和协议边界、跨 scope 引用、取消与失败恢复。额外原生回归验证稀疏标签、空结果、当前身份及两类索引计划；384 维、三个 scope 的 36 次合成对照中，两通道候选排序与冻结双查询路径一致。
 
 本次改动的 Python 源码与自有测试通过 Ruff、格式和类型检查，产品依赖与锁文件未改变。全库预提交检查仍发现官方公开资产中的既有类型或格式诊断；这些文件保持原样。
 
