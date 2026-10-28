@@ -31,6 +31,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import match
 from sqlalchemy.ext.asyncio import AsyncConnection
+from typing_extensions import override
 
 from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.memory import (
@@ -42,7 +43,7 @@ from powercontext.builtin.artifacts.memory import (
     MemorySearchRequest,
 )
 from powercontext.builtin.artifacts.memory.canonical import embedding_content_hash, validate_embedding
-from powercontext.builtin.persistence.memory_index import memory_channel_hits
+from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex, memory_channel_hits
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
     MAX_MEMORY_ENTRY_ID_LENGTH,
@@ -96,6 +97,67 @@ WHERE m.scope_id = :scope_id
   AND m.memory_artifact_id IN :memory_artifact_ids
 ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
 LIMIT :candidate_limit
+"""
+_OCEANBASE_HYBRID_SEARCH_SQL = """
+WITH fts_candidates AS (
+    SELECT f.scope_id, f.memory_artifact_id, f.head_revision,
+           f.entry_id, f.entry_version_id,
+           MATCH(f.searchable_text) AGAINST(:query) AS score
+    FROM pc_memory_entry_heads AS f
+    WHERE f.scope_id = :scope_id
+      AND f.memory_artifact_id IN :memory_artifact_ids
+      AND MATCH(f.searchable_text) AGAINST(:query)
+    {fts_tags}
+    ORDER BY score DESC, f.memory_artifact_id, f.entry_id, f.entry_version_id
+    LIMIT :candidate_limit
+), vector_candidates AS (
+    SELECT m.scope_id, m.memory_artifact_id, m.head_revision,
+           m.entry_id, m.entry_version_id,
+           l2_distance(m.embedding, :query_vector) AS distance
+    FROM pc_memory_vector_entries AS m
+    WHERE m.scope_id = :scope_id
+      AND m.memory_artifact_id IN :memory_artifact_ids
+    {vector_tags}
+    ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
+    LIMIT :candidate_limit
+), candidates AS (
+    SELECT 'fts' AS channel, scope_id, memory_artifact_id, head_revision,
+           entry_id, entry_version_id, score, NULL AS distance
+    FROM fts_candidates
+    UNION ALL
+    SELECT 'vector' AS channel, scope_id, memory_artifact_id, head_revision,
+           entry_id, entry_version_id, NULL AS score, distance
+    FROM vector_candidates
+)
+SELECT c.channel, c.memory_artifact_id, c.head_revision,
+       c.entry_id, c.entry_version_id, v.text, c.distance
+FROM candidates AS c
+JOIN pc_memory_entry_versions AS v
+  ON v.scope_id = c.scope_id
+ AND v.memory_artifact_id = c.memory_artifact_id
+ AND v.entry_version_id = c.entry_version_id
+ORDER BY c.channel, c.score DESC, c.distance,
+         c.memory_artifact_id, c.entry_id, c.entry_version_id
+"""
+# A correlated tag subquery is evaluated *after* the ANN executor's top-k in
+# seekdb. Build the eligible identities once instead, so membership becomes a
+# predicate inside its native pre-filter and sparse tags cannot underfill k.
+_OCEANBASE_HYBRID_VECTOR_TAG_SQL = """
+AND JSON_CONTAINS((
+    SELECT JSON_ARRAYAGG(JSON_OBJECT('artifact', selected.artifact_id, 'entry', selected.target_id))
+    FROM (
+        SELECT tags.artifact_id, tags.target_id
+        FROM pc_artifact_tags AS tags
+        WHERE tags.scope_id = :scope_id
+          AND tags.family = 'memory'
+          AND tags.target_type = 'memory_entry'
+          AND tags.artifact_id IN :memory_artifact_ids
+          AND tags.tag_key_hash IN :tag_hashes
+          AND tags.tag_key IN :tag_keys
+        GROUP BY tags.artifact_id, tags.target_id
+        HAVING COUNT(*) >= :tag_minimum
+    ) AS selected
+), JSON_OBJECT('artifact', m.memory_artifact_id, 'entry', m.entry_id))
 """
 
 
@@ -493,6 +555,66 @@ class OceanBaseMemoryVectorIndex:
                 )
             )
         return tuple(hydrated)
+
+
+class OceanBaseMemoryHybridIndex(CompositeMemoryIndex):
+    """Retrieve both native channels in one statement, sharing existing writes."""
+
+    def __init__(self, profile: EmbeddingProfile) -> None:
+        self._vector = OceanBaseMemoryVectorIndex(profile)
+        super().__init__(OceanBaseMemoryFTSIndex(), self._vector)
+        parameters = (
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("query_vector", type_=VECTOR(profile.dimension)),
+        )
+        self._hybrid_search_sql = text(_OCEANBASE_HYBRID_SEARCH_SQL.format(fts_tags="", vector_tags="")).bindparams(
+            *parameters
+        )
+        self._tagged_hybrid_search_sql = text(
+            _OCEANBASE_HYBRID_SEARCH_SQL.format(
+                fts_tags=memory_tag_sql("f"), vector_tags=_OCEANBASE_HYBRID_VECTOR_TAG_SQL
+            )
+        ).bindparams(*parameters, bindparam("tag_keys", expanding=True), bindparam("tag_hashes", expanding=True))
+
+    @override
+    async def search(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels:
+        if request.mode != "hybrid":
+            return await super().search(connection, scope_id, request)
+        if request.embedding_profile != self._vector.profile or request.query_vector is None:
+            raise CapabilityNotSupportedError("embedding-profile")
+        if not await self.vector_complete(connection, scope_id, request.memories, self._vector.profile):
+            raise CapabilityNotSupportedError("vector")
+        # Keep projection revisions independent from the validated current head:
+        # unchanged active entries are deliberately not restamped on append.
+        rows = (
+            (
+                await connection.execute(
+                    self._hybrid_search_sql if request.tag_filter is None else self._tagged_hybrid_search_sql,
+                    {
+                        "scope_id": scope_id,
+                        "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
+                        "query": request.analyzed_query,
+                        "query_vector": validate_embedding(
+                            request.query_vector, dimension=self._vector.profile.dimension
+                        ),
+                        "candidate_limit": request.candidate_limit,
+                        **memory_tag_parameters(request.tag_filter),
+                    },
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return MemorySearchChannels(
+            fts=memory_channel_hits((row for row in rows if row["channel"] == "fts"), request.memories),
+            vector=memory_channel_hits((row for row in rows if row["channel"] == "vector"), request.memories),
+        )
 
 
 def _embedding_hash(profile: EmbeddingProfile, entry_hash: str) -> str:
