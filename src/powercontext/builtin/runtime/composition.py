@@ -653,6 +653,9 @@ async def open_builtin_runtime(
                 remote_ingestion=contexts,
             )
         )
+        from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+
+        runtime.lifecycle = SourceLifecycleApplication(runtime, contexts.database)
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )

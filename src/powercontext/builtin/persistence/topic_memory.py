@@ -54,6 +54,7 @@ from powercontext.builtin.persistence.supervision import database_utc_now
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
     ARTIFACTS_TABLE,
+    SOURCE_LIFECYCLE_NODES_TABLE,
     TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
     TOPIC_MEMORY_ACTIVE_TOPICS_TABLE,
     TOPIC_MEMORY_RETRIEVAL_SHAPE_TABLE,
@@ -379,6 +380,14 @@ class TopicMemoryRepository:
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.family == TopicMemory.family,
+                ~select(SOURCE_LIFECYCLE_NODES_TABLE.c.node_id)
+                .where(
+                    SOURCE_LIFECYCLE_NODES_TABLE.c.scope_id == scope_id,
+                    SOURCE_LIFECYCLE_NODES_TABLE.c.kind == "topic",
+                    SOURCE_LIFECYCLE_NODES_TABLE.c.artifact_id == TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id,
+                    SOURCE_LIFECYCLE_NODES_TABLE.c.available.is_(False),
+                )
+                .exists(),
             )
         )
         if tag_filter is not None:
@@ -487,6 +496,27 @@ class TopicMemoryRepository:
             admission=admission,
         )
         channels = await self.index.search(connection, scope_id, request)
+        # Lifecycle eligibility is independent of immutable Topic bodies and
+        # complete index projections, which remain readable for historical audit.
+        lifecycle = SOURCE_LIFECYCLE_NODES_TABLE
+        unavailable = set(
+            await connection.scalars(
+                select(lifecycle.c.artifact_id).where(
+                    lifecycle.c.scope_id == scope_id,
+                    lifecycle.c.kind == "topic",
+                    lifecycle.c.available.is_(False),
+                )
+            )
+        )
+        if unavailable:
+            channels = channels.model_copy(
+                update={
+                    channel: tuple(
+                        hit for hit in getattr(channels, channel) if hit.artifact_ref.artifact_id not in unavailable
+                    )
+                    for channel in ("topic_fts", "topic_vector", "detail_fts", "detail_vector")
+                }
+            )
         await self._check_retrieval_shape(connection)
         outcome = _fuse_topic_memory_rankings(query, channels, limit, mode=used_mode, admission=admission)
         return TopicMemorySearchResult(
