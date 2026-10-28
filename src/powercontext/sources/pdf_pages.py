@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBytes, StrictInt, StrictStr, model_validator
 
 from powercontext.builtin.artifacts.memory.models import MemoryCitation, MemoryHit
-from powercontext.builtin.artifacts.search import analyze_fts_query
+from powercontext.builtin.artifacts.search import analyze_fts_query, analyze_text
 from powercontext.builtin.runtime.models import GetMemoryEntryRequest, SearchMemoryRequest
 from powercontext.sources.definitions import AdapterSourceDefinition, SourceDefinition
 from powercontext.sources.models import Source, SourceMaterialization
@@ -224,16 +224,38 @@ def _question_terms(question: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys([*terms, *expanded]))
 
 
-def _rank_pages(hits: dict[tuple[str, str, int, str, str], MemoryHit], terms: tuple[str, ...]) -> list[MemoryHit]:
+def _document_priority(text: str, question: str) -> int:
+    """Recognize a queried issuer from the projected document label."""
+
+    label = text.partition("\n")[0]
+    company = re.split(r"(?:19|20)\d{2}", label, maxsplit=1)[0]
+    generic = {"inc", "incorporated", "corp", "corporation", "company", "ltd", "limited", "plc", "annual", "report"}
+    name_parts = [word.casefold() for word in re.findall(r"[^\W_]+", company) if word.casefold() not in generic]
+    name = "".join(name_parts)
+    words = re.findall(r"[^\W_]+", question.casefold())
+    width = max(1, len(name_parts) + 1)
+    names = {
+        "".join(words[start:end])
+        for start in range(len(words))
+        for end in range(start + 1, min(len(words), start + width) + 1)
+    }
+    return int(len(name) > 1 and name in names)
+
+
+def _rank_pages(
+    hits: dict[tuple[str, str, int, str, str], MemoryHit], terms: tuple[str, ...], question: str
+) -> list[MemoryHit]:
     records = list(hits.values())
-    tokenized = [Counter(re.findall(r"[a-z]+|\d+", hit.text.casefold())) for hit in records]
+    # Use the same alphanumeric/Unicode terms as the query and the Memory index.
+    # Splitting letters from digits loses issuer names such as "X7" entirely.
+    tokenized = [Counter(analyze_text(hit.text.replace("_", " ")).split()) for hit in records]
     count = len(records)
     if not count:
         return []
     average = sum(sum(tokens.values()) for tokens in tokenized) / count or 1
     frequency = Counter(term for tokens in tokenized for term in terms if term in tokens)
 
-    def rank(index: int) -> tuple[float, int]:
+    def rank(index: int) -> tuple[int, float, int]:
         tokens = tokenized[index]
         length = sum(tokens.values())
         score = 0.0
@@ -242,7 +264,8 @@ def _rank_pages(hits: dict[tuple[str, str, int, str, str], MemoryHit], terms: tu
             if tf:
                 idf = math.log1p((count - frequency[term] + 0.5) / (frequency[term] + 0.5))
                 score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length / average))
-        return (-score, index)
+        company = _document_priority(records[index].text, question)
+        return (-company, -score, index)
 
     return [records[index] for index in sorted(range(count), key=rank)]
 
@@ -258,9 +281,13 @@ async def search_pdf_pages(
         raise ValueError("PDF search limit must be a positive integer")  # noqa: TRY003
     terms = _question_terms(question)
     queries = tuple(dict.fromkeys((question, *terms)))
+    # A fixed per-term top-80 pool can exclude every page of a named issuer
+    # when other reports have shorter, repetitive pages. Size recall from the
+    # real active Memory snapshot; all candidates still come from Memory.search.
+    candidate_limit = max(80, len((await memory.list()).entries), limit)
     hits: dict[tuple[str, str, int, str, str], MemoryHit] = {}
     for query in queries:
-        result = await memory.search(SearchMemoryRequest(query=query, limit=max(80, limit * 4), mode="fts"))
+        result = await memory.search(SearchMemoryRequest(query=query, limit=candidate_limit, mode="fts"))
         for hit in result.hits:
             identity = (
                 hit.memory_ref.family,
@@ -272,7 +299,7 @@ async def search_pdf_pages(
             hits.setdefault(identity, hit)
     citations: list[MemoryCitation] = []
     pages: set[tuple[str, str]] = set()
-    for hit in _rank_pages(hits, terms):
+    for hit in _rank_pages(hits, terms, question):
         citation = MemoryCitation(
             memory_ref=hit.memory_ref, entry_id=hit.entry_id, entry_version_id=hit.entry_version_id
         )

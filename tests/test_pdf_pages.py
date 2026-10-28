@@ -164,3 +164,47 @@ def test_search_uses_persisted_scope_and_returns_exact_page_citations_after_rest
                 await search_pdf_pages(memory, "operating income", limit=True)
 
     asyncio.run(scenario())
+
+
+def test_named_company_evidence_is_not_displaced_by_other_companies_short_pages(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        target = parse_pdf_document(
+            PDFDocumentInput(
+                document_id="X7_2023_10K",
+                content=pdf_bytes(("General accounting disclosures. " * 100 + "Operating income 240.",)),
+            )
+        )
+        unrelated = parse_pdf_document(
+            PDFDocumentInput(
+                document_id="OTHER_2023_10K",
+                content=pdf_bytes(tuple("Operating income operating income 2023." for _ in range(25))),
+            )
+        )
+        registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
+        observations = [
+            project_source_for_transport(registry, await registry.resolve(page)) for page in (*target, *unrelated)
+        ]
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'companies.db'}"))
+        async with open_builtin_runtime(config) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Company reports", summary="Separate issuers", idempotency_key="companies")
+            )
+            await runtime.ingestion.register(manifest_for_definition(PDF_PAGE_SOURCE_DEFINITION))
+            for observation in observations:
+                await runtime.ingestion.submit(
+                    SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
+                )
+        async with open_builtin_runtime(config, candidate_pipeline=_EvidencePipeline()) as runtime:
+            memory = runtime.memory.for_scope(scope.scope_id)
+            for _ in range(len(observations) + 1):
+                if not (await memory.flush()).processed:
+                    break
+        async with open_builtin_runtime(config) as runtime:
+            memory = runtime.memory.for_scope(scope.scope_id)
+            citations = await search_pdf_pages(memory, "What is X7's operating income for 2023?", limit=1)
+            assert len(citations) == 1
+            entry = (await memory.get(GetMemoryEntryRequest(citation=citations[0]))).entry
+            assert entry.sources[0].source_id == observations[0].name
+
+    asyncio.run(scenario())
