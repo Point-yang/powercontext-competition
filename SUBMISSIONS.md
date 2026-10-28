@@ -16,8 +16,9 @@ PowerContext 全部题目使用报名时登记的同一个仓库地址，通过 
 
 | 题目 | Branch | Commit ID | 代码准备情况 |
 | --- | --- | --- | --- |
-| 一 准备 PowerContext 参赛仓库 | `chore/repository-setup` | `dab240063bfcfa7917898dc44da4baadb3747bd0` | 保留官方冻结基线历史；平台读取权限仍须满足 |
-| 二 CSV 行级采集与原始记录回查 | `feat/csv-row-source` | `d78a4cfb78d67ed6686b83bd104790c50132fde7` | 官方公开测试 17 项、相关回归 71 项通过；未确认正式评测成绩 |
+| 一 准备 PowerContext 参赛仓库 | `chore/repository-setup` | `dab240063bfcfa7917898dc44da4baadb3747bd0` | 已通过（参赛者确认）；保留官方冻结基线历史 |
+| 二 CSV 行级采集与原始记录回查 | `feat/csv-row-source` | `d78a4cfb78d67ed6686b83bd104790c50132fde7` | 已通过（参赛者确认）；CSV 实现保留在累计版本 |
+| 三 Pi 会话分支采集与断点恢复 | `feat/pi-history` | 从对应分支最新提交复制完整 40 位 SHA | 完整事件、持久化断点与公开自测已完成 |
 
 Branch 是代码分支，例如 `feat/csv-row-source` 表示 CSV 功能分支；名称中的 `/` 是分支名的一部分。Commit ID 是一次提交的完整标识。提交后分支还可以继续更新，但已经填写的 Commit ID 始终代表同一个版本。
 
@@ -28,10 +29,10 @@ Branch 是代码分支，例如 `feat/csv-row-source` 表示 CSV 功能分支；
 | 题目或用途 | 分支 | 状态 |
 | --- | --- | --- |
 | 官方公开赛题起点 | `baseline/2026-competition` | 已建立，固定为 `dab240063bfcfa7917898dc44da4baadb3747bd0`，不提交个人实现 |
-| 已完成题目的累计版本 | `2026-competition` | 默认分支，已包含 CSV 实现和本提交说明 |
+| 已完成题目的累计版本 | `2026-competition` | 默认分支，包含 CSV 与 Pi 历史采集实现 |
 | 一 仓库准备 | `chore/repository-setup` | 已建立 |
 | 二 CSV 行级采集 | `feat/csv-row-source` | 已建立 |
-| 三 Pi 会话分支采集与断点恢复 | `feat/pi-history` | 计划，开始该题时创建 |
+| 三 Pi 会话分支采集与断点恢复 | `feat/pi-history` | 已建立，包含累计版本中的 CSV 功能 |
 | 四 财报 PDF 全文解析与证据页检索 | `feat/pdf-retrieval` | 计划，开始该题时创建 |
 | 五 HTTP 重排服务接入与跨批次排序 | `feat/http-reranking` | 计划，开始该题时创建 |
 | 六 上下文增量传输与完整重建 | `feat/incremental-context` | 计划，开始该题时创建 |
@@ -47,36 +48,54 @@ Branch 是代码分支，例如 `feat/csv-row-source` 表示 CSV 功能分支；
 
 `main` 保留最初的 README 初始化提交，未包含 PowerContext 源码，不用作参赛代码版本。
 
-## 第一题的提交与核查
+## 第三题实现与提测
 
-第一题单独留存的仓库准备版本如下：
+本题在已包含 CSV 功能的累计版本上开发。实现位于 `src/powercontext/sources/pi_session.py`，不修改官方评测资产或固定依赖。
+
+- `PiSessionInput` 和 `parse_pi_session` 完整验证 UTF-8 Pi v3 JSONL，根据默认或显式叶节点返回所选分支的全部可见事件。
+- 保留控制节点的父链关系、压缩前原文、工具调用、完整工具结果、摘要与完整输入 record。
+- `PI_EVENT_SOURCE_DEFINITION` 提供 CAPTURED Source、稳定事件身份、标准文本证据投影及原始事件回读。
+- `PiSessionConnector` 通过已有 `ConnectorLifecycle` 保存 checkpoint，支持切分支、追加、进程重启、失败恢复和已采集记录改写检查。
+- Source 保存完整大文本，派生 Memory 的大小限制不会截断原始事件。
+
+在平台的 PowerContext 题目中选择“赛题三：Pi 会话分支采集与断点恢复”，提测填写：
 
 ```text
 代码仓库地址：https://github.com/Point-yang/powercontext-competition
-Branch：chore/repository-setup
-Commit ID：dab240063bfcfa7917898dc44da4baadb3747bd0
+Branch：feat/pi-history
+Commit ID：复制该分支已上传版本的完整 40 位提交标识
 ```
 
-此版本不包含第二题 CSV 实现。若从 PowerContext 整组提测入口提交所有已完成题目，使用累计分支 `2026-competition` 当时的最新完整 Commit ID，或使用 `feat/csv-row-source` 与 `d78a4cfb78d67ed6686b83bd104790c50132fde7`。换用第一题专用分支本身不能解决先前的执行失败。
+报名页面自动带出的仓库地址保持原有登记配置。不要在仓库根地址后追加 `/tree/feat/pi-history` 或题号目录。
 
-第一题要求仓库可读取，且保留官方 Fork 关联或至少一个分支包含冻结基线 `9db1753434162c0aa7c9f1189a1722e617880a52`。当前导入仓库采用后一个条件；第一题无需新代码、专用分支或 PR。见[官方第一题说明](https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/ygfg2iskh62zntl5)及[仓库中的题面](competition/challenges/setup-00-repository-fork/instruction.md)。
-
-2026 年 10 月 27 日的检查结果：
-
-- 15:40 提测记录的仓库根地址、分支和完整 Commit ID 均与 GitHub 实际历史对应；该提交包含冻结基线。
-- 该记录显示“执行失败”，结果列为 `-`，问号未展示具体报错；页面没有提供足以确定失败原因的日志。
-- 仓库仍为 Private。个人 GitHub 登录和本地推送权限不能证明官方评测系统已获得读取权限。私有仓库须按赛事约定授权；选择公开仓库则需仓库所有者确认公开。
-- 16:52 的 CSV 提测记录仍显示“待执行”，不能据此判定 CSV 实现失败。
-
-因此，现有证据不支持将失败归因于填写路径或分支名称。下一步应核实官方读取权限，或取得这次任务的后台错误日志。若权限无误，再排查 GitHub 网络、认证、限流及评测服务异常。平台未给出分题结果时，也不能仅凭整组“执行失败”判断第一题的正式判分。
-
-本地可检查提交历史：
+从 GitHub 对应分支的最新提交页面复制 Commit ID，或在本地执行：
 
 ```bash
-git merge-base --is-ancestor \
-  9db1753434162c0aa7c9f1189a1722e617880a52 \
-  chore/repository-setup
-make -C competition check-baseline
+git rev-parse feat/pi-history
 ```
 
-命令成功只证明本地历史符合基线要求，不证明评测系统能够读取私有仓库。
+需要提测当前所有已完成实现时，也可使用累计分支 `2026-competition` 的最新完整 Commit ID。第一、二题的专用分支及已提交历史仍保留。
+
+## 提交前验证
+
+官方公开自测使用 `competition/.venv` 中的 Python 3.12 和固定依赖：
+
+```bash
+make -C competition check-baseline test-pi test-csv
+```
+
+产品专项测试及真实 SQLite 持久化回归：
+
+```bash
+PYTHONPATH="$PWD/src" PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  competition/.venv/bin/python -m pytest -p pytest_asyncio.plugin \
+  -o asyncio_mode=auto -q tests/test_pi_session.py tests/e2e/test_pi_session_persistence.py
+```
+
+本地验证包括默认与显式叶节点、工具调用和结果、压缩摘要之前的事件、Unicode 与原文空白、分支共享祖先去重、重启恢复、失败后继续、历史改写拒绝，以及大工具结果的逐事件精确引用回读。
+
+本题源文件与两个自有测试文件的 Ruff、格式和类型检查通过。全库类型检查仍有其他未实现赛题接口及公开验收代码的既有错误；没有修改这些官方资产。
+
+本地公开测试和产品回归不生成正式成绩。平台可能对整组题目运行评测，后续题目尚未实现时，应按分题结果确认第三题；正式通过情况以平台回传为准。
+
+官方题面：[Pi 会话分支采集与断点恢复](https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/oi71gg4g80uda2ls)。
