@@ -184,6 +184,37 @@ _FINANCIAL_TERMS = {
     "lawsuits": ("litigation", "legal", "proceedings"),
     "battles": ("litigation", "proceedings"),
 }
+# A question may ask whether a line item is absent from a named statement.
+# Matching only that line item's words cannot retrieve the required evidence.
+_STATEMENT_TOPICS = {
+    "income": (
+        r"income statements?|(?:profit (?:and )?loss|earnings) statements?|"
+        r"statements? of (?:income|operations|earnings|profit (?:and )?loss)",
+        r"(?:statements? of (?:income|operations|earnings|profit(?:s)?(?: and loss(?:es)?)?)|"
+        r"(?:income|profit(?:s)? and loss(?:es)?) statements?)"
+        r"(?: and comprehensive (?:income|loss))?",
+        ("income", "operations", "earnings"),
+    ),
+    "cash": (
+        r"cash flows?",
+        r"(?:statements? of cash flows?|cash flows? statements?)",
+        ("cash", "flows"),
+    ),
+    "balance": (
+        r"balance sheets?|statements? of financial (?:position|condition)",
+        r"(?:balance sheets?|statements? of financial (?:position|condition))",
+        ("balance", "sheet", "financial", "position", "condition"),
+    ),
+}
+_STATEMENT_HEADINGS = {
+    name: re.compile(
+        r"(?P<qualifiers>(?:(?:consolidated|combined|condensed|unaudited)\s+)*)"
+        + heading
+        + r"(?:\s*\((?:continued|unaudited)\))*\s*[:.]?",
+        re.IGNORECASE,
+    )
+    for name, (_, heading, _) in _STATEMENT_TOPICS.items()
+}
 _QUESTION_WORDS = frozenset({
     "has",
     "have",
@@ -217,11 +248,43 @@ _QUESTION_WORDS = frozenset({
 })
 
 
-def _question_terms(question: str) -> tuple[str, ...]:
+def _normalize_question(question: str) -> str:
     normalized = re.sub(r"\bfy\s*['’]?(\d{4})\b", r"\1", question.casefold())  # noqa: RUF001
-    terms = [term for term in analyze_fts_query(normalized).split() if term not in _QUESTION_WORDS]
+    normalized = re.sub(r"\bp\s*&\s*l\b", "profit and loss statement", normalized)
+    return re.sub(r"\bd\s*&\s*a\b", "depreciation and amortization", normalized)
+
+
+def _statement_intents(question: str) -> tuple[str, ...]:
+    normalized = _normalize_question(question)
+    topics = [name for name, (pattern, _, _) in _STATEMENT_TOPICS.items() if re.search(pattern, normalized)]
+    if re.search(r"\bebitda\b", normalized):
+        # Operating earnings and D&A are often reported on different statements.
+        topics.extend(("income", "cash"))
+    return tuple(dict.fromkeys(topics))
+
+
+def _question_terms(question: str) -> tuple[str, ...]:
+    terms = [
+        term
+        for term in analyze_fts_query(_normalize_question(question)).split()
+        if term not in _QUESTION_WORDS and not (len(term) == 1 and term.isalpha())
+    ]
     expanded = [alias for term in terms for alias in _FINANCIAL_TERMS.get(term, ())]
-    return tuple(dict.fromkeys([*terms, *expanded]))
+    statement_terms = [term for topic in _statement_intents(question) for term in _STATEMENT_TOPICS[topic][2]]
+    return tuple(dict.fromkeys([*terms, *expanded, *statement_terms]))
+
+
+def _page_statement_topics(text: str) -> dict[str, int]:
+    # Titles can wrap, but a prose reference to a statement is not its title.
+    lines = [line.strip() for line in text.partition("\n")[2].splitlines() if line.strip()][:20]
+    headings = [" ".join(lines[start : start + width]) for start in range(len(lines)) for width in (1, 2, 3)]
+    topics: dict[str, int] = {}
+    for name, pattern in _STATEMENT_HEADINGS.items():
+        for heading in headings:
+            if match_ := pattern.fullmatch(heading):
+                # Formal statement titles outrank bare column labels in notes.
+                topics[name] = max(topics.get(name, 0), 1 + bool(match_["qualifiers"]))
+    return topics
 
 
 def _document_priority(text: str, question: str) -> int:
@@ -267,7 +330,27 @@ def _rank_pages(
         company = _document_priority(records[index].text, question)
         return (-company, -score, index)
 
-    return [records[index] for index in sorted(range(count), key=rank)]
+    ranked = sorted(range(count), key=rank)
+    intents = _statement_intents(question)
+    if not intents:
+        return [records[index] for index in ranked]
+    best_company = _document_priority(records[ranked[0]].text, question)
+    statement_pages = {index: _page_statement_topics(records[index].text) for index in ranked}
+    by_topic: list[list[int]] = []
+    for topic in intents:
+        eligible = [
+            index
+            for index in ranked
+            if topic in statement_pages[index] and _document_priority(records[index].text, question) == best_company
+        ]
+        if eligible:
+            confidence = max(statement_pages[index][topic] for index in eligible)
+            by_topic.append([index for index in eligible if statement_pages[index][topic] == confidence][:2])
+    # Reserve both requested statements before taking a second continuation page.
+    # The rest of the result retains the original lexical ranking and evidence.
+    reserved = list(dict.fromkeys(pages[round_] for round_ in range(2) for pages in by_topic if len(pages) > round_))
+    reserved_set = set(reserved)
+    return [records[index] for index in (*reserved, *(index for index in ranked if index not in reserved_set))]
 
 
 async def search_pdf_pages(

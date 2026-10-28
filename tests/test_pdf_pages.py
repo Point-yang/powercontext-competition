@@ -208,3 +208,54 @@ def test_named_company_evidence_is_not_displaced_by_other_companies_short_pages(
             assert entry.sources[0].source_id == observations[0].name
 
     asyncio.run(scenario())
+
+
+def test_requested_statements_survive_repetitive_notes_and_cover_multiple_evidence_aspects(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        pages = parse_pdf_document(
+            PDFDocumentInput(
+                document_id="NORTH_2025_10K",
+                content=pdf_bytes((
+                    "Consolidated Statements of\nOperations and Comprehensive Income\nRevenue 900. Operating profit 70.",
+                    "Condensed Statements of Cash Flows\nDepreciation and amortization 20. Purchases of equipment 30.",
+                    "Combined Statements of Financial Position\nAssets 800. Liabilities 300. Equity 500.",
+                    "Consolidated Statement of Comprehensive Income\nOther comprehensive income 6.",
+                    "Notes to financial instruments\nIncome Statement\n"
+                    "Restructuring costs NORTH income statement 2025 EBITDA margin. " * 5,
+                    *(
+                        "Note: financial definitions\n"
+                        "Restructuring costs income statement EBITDA margin cash flow balance sheet 2025. " * 5
+                        for _ in range(25)
+                    ),
+                )),
+            )
+        )
+        registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
+        observations = [project_source_for_transport(registry, await registry.resolve(page)) for page in pages]
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'statements.db'}"))
+        async with open_builtin_runtime(config, candidate_pipeline=_EvidencePipeline()) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Statements", summary="Complete evidence", idempotency_key="statements")
+            )
+            await runtime.ingestion.register(manifest_for_definition(PDF_PAGE_SOURCE_DEFINITION))
+            for observation in observations:
+                await runtime.ingestion.submit(
+                    SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
+                )
+            memory = runtime.memory.for_scope(scope.scope_id)
+            for _ in range(len(observations) + 1):
+                if not (await memory.flush()).processed:
+                    break
+            for question, expected, limit in (
+                ("Does NORTH show restructuring costs in its 2025 income statement?", {observations[0].name}, 1),
+                ("Calculate NORTH's 2025 EBITDA margin using P&L and D&A.", {o.name for o in observations[:2]}, 4),
+                ("What are NORTH's liabilities on the 2025 balance sheet?", {observations[2].name}, 1),
+            ):
+                citations = await search_pdf_pages(memory, question, limit=limit)
+                entries = [(await memory.get(GetMemoryEntryRequest(citation=citation))).entry for citation in citations]
+                assert expected <= {source.source_id for entry in entries for source in entry.sources}
+                assert len(citations) == limit
+                assert len({(citation.entry_id, citation.entry_version_id) for citation in citations}) == limit
+
+    asyncio.run(scenario())
