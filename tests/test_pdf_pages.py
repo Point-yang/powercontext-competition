@@ -138,7 +138,9 @@ def test_search_uses_persisted_scope_and_returns_exact_page_citations_after_rest
         async with open_builtin_runtime(config) as runtime:
             assert runtime.scopes is not None
             scope = await runtime.scopes.create(ScopeDraft(title="PDF", summary="Pages", idempotency_key="pdf"))
-            other_scope = await runtime.scopes.create(ScopeDraft(title="Empty", summary="Empty", idempotency_key="empty"))
+            other_scope = await runtime.scopes.create(
+                ScopeDraft(title="Empty", summary="Empty", idempotency_key="empty")
+            )
             await runtime.ingestion.register(manifest_for_definition(PDF_PAGE_SOURCE_DEFINITION))
             for observation in observations:
                 await runtime.ingestion.submit(
