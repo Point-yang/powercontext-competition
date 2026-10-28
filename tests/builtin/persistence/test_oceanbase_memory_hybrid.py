@@ -205,3 +205,102 @@ def test_native_hybrid_applies_sparse_tags_before_ann_limit(tmp_path) -> None:
             assert "VECTOR INDEX" in plan
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(os.environ.get("POWERCONTEXT_TEST_SEEKDB") != "1", reason="requires POWERCONTEXT_TEST_SEEKDB=1")
+def test_native_hybrid_preserves_equal_distance_candidate_ranks(tmp_path) -> None:
+    """Equal-distance ANN results retain their rank through the union and body join.
+
+    Vector ranks contribute to reciprocal-rank fusion even when their distances
+    are equal. Re-sorting these candidates by identity can demote lexical evidence
+    that the frozen two-statement search ranks first.
+    """
+    pytest.importorskip("pylibseekdb")
+    from sqlalchemy import Engine, event
+
+    from powercontext.builtin.artifacts.memory import MemoryEntryInput
+    from powercontext.builtin.artifacts.search import analyze_fts_query
+    from powercontext.builtin.inference import EmbeddingResult
+    from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex
+    from powercontext.builtin.persistence.oceanbase.memory_index import (
+        OceanBaseMemoryFTSIndex,
+        OceanBaseMemoryVectorIndex,
+    )
+    from powercontext.builtin.persistence.seekdb import SeekDBConfig
+    from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
+
+    profile = EmbeddingProfile(
+        profile_id="same-distance", model="same-distance", dimension=384, distance="l2", normalization="unit"
+    )
+    vector = (1.0, *(0.0 for _ in range(383)))
+
+    class Embedding:
+        def __init__(self) -> None:
+            self.profile = profile
+
+        async def embed(self, texts: tuple[str, ...], /) -> EmbeddingResult:
+            return EmbeddingResult(vectors=tuple(vector for _ in texts))
+
+    model = Embedding()
+
+    async def scenario() -> None:
+        statements = []
+
+        def record(_connection, _cursor, sql, parameters, _context, _executemany) -> None:
+            if "WITH fts_candidates" in sql:
+                statements.append((sql, parameters))
+
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SeekDBConfig(path=tmp_path / "db")), embedding_model=model
+        ) as contexts:
+            memory = (await contexts.get("project")).artifacts.memory
+            head = await memory.remember(
+                memory=None,
+                entries=tuple(
+                    MemoryEntryInput(
+                        kind="fact",
+                        text=(
+                            "Alpha evidence."
+                            if index == 22
+                            else f"Alpha record {index}. " + "Unrelated research distraction. " * 20
+                        ),
+                    )
+                    for index in range(48)
+                ),
+                mode="append",
+            )
+            assert head is not None
+            index = OceanBaseMemoryHybridIndex(profile)
+            frozen = CompositeMemoryIndex(OceanBaseMemoryFTSIndex(), OceanBaseMemoryVectorIndex(profile))
+            request = MemorySearchRequest(
+                query="alpha evidence",
+                analyzed_query=analyze_fts_query("alpha evidence"),
+                memories=(head.as_ref(),),
+                candidate_limit=40,
+                mode="hybrid",
+                query_vector=vector,
+                embedding_profile=profile,
+            )
+            async with contexts.database.transaction() as connection:
+                expected = await frozen.search(connection, "project", request)
+                event.listen(Engine, "before_cursor_execute", record)
+                try:
+                    actual = await index.search(connection, "project", request)
+                    repeated = await index.search(connection, "project", request)
+                finally:
+                    event.remove(Engine, "before_cursor_execute", record)
+                assert actual.fts == expected.fts
+                assert actual.vector == expected.vector, (
+                    tuple(hit.entry_id for hit in actual.vector),
+                    tuple(hit.entry_id for hit in expected.vector),
+                )
+                assert repeated == expected
+                assert len(statements) == 2
+                sql, parameters = statements[0]
+                plan = "\n".join(
+                    str(row[0]) for row in (await connection.exec_driver_sql("EXPLAIN " + sql, parameters)).all()
+                )
+                assert "TEXT RETRIEVAL SCAN" in plan
+                assert "VECTOR INDEX" in plan
+
+    asyncio.run(scenario())

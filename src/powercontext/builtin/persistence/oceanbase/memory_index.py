@@ -98,12 +98,18 @@ WHERE m.scope_id = :scope_id
 ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
 LIMIT :candidate_limit
 """
+# Preserve the native ANN stream's rank before the union. Sorting
+# equal distances by identity instead can change reciprocal-rank fusion results.
 _OCEANBASE_HYBRID_SEARCH_SQL = """
 WITH fts_candidates AS (
     SELECT f.scope_id, f.memory_artifact_id, f.head_revision,
-           f.entry_id, f.entry_version_id,
+           f.entry_id, f.entry_version_id, v.text,
            MATCH(f.searchable_text) AGAINST(:query) AS score
     FROM pc_memory_entry_heads AS f
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = f.scope_id
+     AND v.memory_artifact_id = f.memory_artifact_id
+     AND v.entry_version_id = f.entry_version_id
     WHERE f.scope_id = :scope_id
       AND f.memory_artifact_id IN :memory_artifact_ids
       AND MATCH(f.searchable_text) AGAINST(:query)
@@ -112,31 +118,34 @@ WITH fts_candidates AS (
     LIMIT :candidate_limit
 ), vector_candidates AS (
     SELECT m.scope_id, m.memory_artifact_id, m.head_revision,
-           m.entry_id, m.entry_version_id,
+           m.entry_id, m.entry_version_id, v.text,
            l2_distance(m.embedding, :query_vector) AS distance
     FROM pc_memory_vector_entries AS m
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = m.scope_id
+     AND v.memory_artifact_id = m.memory_artifact_id
+     AND v.entry_version_id = m.entry_version_id
     WHERE m.scope_id = :scope_id
       AND m.memory_artifact_id IN :memory_artifact_ids
     {vector_tags}
     ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
     LIMIT :candidate_limit
+), ranked_vector_candidates AS (
+    SELECT vector_candidates.*, ROW_NUMBER() OVER () AS channel_rank
+    FROM vector_candidates
 ), candidates AS (
     SELECT 'fts' AS channel, scope_id, memory_artifact_id, head_revision,
-           entry_id, entry_version_id, score, NULL AS distance
+           entry_id, entry_version_id, text, score, NULL AS distance, 0 AS channel_rank
     FROM fts_candidates
     UNION ALL
     SELECT 'vector' AS channel, scope_id, memory_artifact_id, head_revision,
-           entry_id, entry_version_id, NULL AS score, distance
-    FROM vector_candidates
+           entry_id, entry_version_id, text, NULL AS score, distance, channel_rank
+    FROM ranked_vector_candidates
 )
 SELECT c.channel, c.memory_artifact_id, c.head_revision,
-       c.entry_id, c.entry_version_id, v.text, c.distance
+       c.entry_id, c.entry_version_id, c.text, c.distance
 FROM candidates AS c
-JOIN pc_memory_entry_versions AS v
-  ON v.scope_id = c.scope_id
- AND v.memory_artifact_id = c.memory_artifact_id
- AND v.entry_version_id = c.entry_version_id
-ORDER BY c.channel, c.score DESC, c.distance,
+ORDER BY c.channel, c.score DESC, c.channel_rank,
          c.memory_artifact_id, c.entry_id, c.entry_version_id
 """
 # A correlated tag subquery is evaluated *after* the ANN executor's top-k in
