@@ -21,6 +21,7 @@ import io
 import json
 import math
 import re
+import unicodedata
 from collections import Counter
 from typing import TYPE_CHECKING, Literal
 
@@ -148,7 +149,9 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
             raise ValueError("PDF requires a non-empty password")  # noqa: TRY003, TRY301 - Normalize parser failures below.
         pages: list[PDFPageInput] = []
         for page_number, page in enumerate(reader.pages, 1):
-            text = _extract_page_text(page)
+            # Memory stores NFC text. Normalize before the captured projection is
+            # created so its exact page body survives persistence unchanged.
+            text = unicodedata.normalize("NFC", _extract_page_text(page))
             text.encode("utf-8")
             pages.append(
                 PDFPageInput(
