@@ -556,6 +556,12 @@ an explicit input is copied into its add or revise change. A candidate generator
 than 8192 bytes when encoded as UTF-8. This limit also ensures that the OceanBase `TEXT` full-text column can hold the
 tokens derived by analyzer v1.
 
+Complete captured `pdf-page` evidence may retain up to 1,048,576 UTF-8 bytes, including the document identifier.
+A body above the ordinary limit must equal the standard text projection of one validated captured PDF source after
+the same normalization. Attaching a PDF reference to an unrelated generated body does not permit a longer entry.
+Canonical hashes, exact reads and projection rebuilds apply this policy from the immutable source references;
+ordinary entry limits and existing short-body canonical encodings remain unchanged.
+
 ## remember()
 
 ```python

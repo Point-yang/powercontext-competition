@@ -1764,7 +1764,13 @@ class ReviseMemoryEntryRequest(BaseModel):
     scope_id: Annotated[StrictStr, Field(max_length=256, min_length=1, pattern=".*\\S.*")]
     citation: MemoryCitation
     kind: Annotated[StrictStr, Field(max_length=128, min_length=1)]
-    text: Annotated[StrictStr, Field(description="Must not exceed 8192 UTF-8 bytes after normalization.", min_length=1)]
+    text: Annotated[
+        StrictStr,
+        Field(
+            description="Ordinary entry text must not exceed 8192 UTF-8 bytes after normalization. An exact complete captured pdf-page projection may contain up to 1048576 UTF-8 bytes, including its document identifier; its authoritative source evidence must be retained.",
+            min_length=1,
+        ),
+    ]
     reason: Annotated[StrictStr | None, Field(max_length=512)] = None
 
 

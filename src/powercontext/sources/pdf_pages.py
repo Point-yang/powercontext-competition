@@ -34,6 +34,8 @@ from powercontext.sources.models import Source, SourceMaterialization
 from powercontext.sources.projections import TEXT_EVIDENCE_PROJECTION_KEY, TextEvidence
 
 if TYPE_CHECKING:
+    from pypdf import PageObject
+
     from powercontext.builtin.runtime.application import ScopedMemoryApplication
 
 
@@ -99,6 +101,38 @@ class PDFPageSource(Source):
         return self
 
 
+_POSITIONED_LETTERS = re.compile(r"(?<!\w)(?:[^\W\d_][ \t]+){3,}[^\W\d_](?!\w)")
+
+
+def _positioned_letter_count(text: str) -> int:
+    return sum(sum(character.isalpha() for character in match[0]) for match in _POSITIONED_LETTERS.finditer(text))
+
+
+def _extract_page_text(page: PageObject) -> str:
+    text = page.extract_text() or ""
+    fragmented_letters = _positioned_letter_count(text)
+    if fragmented_letters < 12:
+        return text
+    try:
+        layout = page.extract_text(
+            extraction_mode="layout", layout_mode_strip_rotated=False, layout_mode_space_vertically=False
+        )
+    except Exception:
+        # Layout is an optional recovery path; a readable default extraction
+        # must not fail merely because a page cannot be laid out horizontally.
+        return text
+    if not layout or _positioned_letter_count(layout) * 2 > fragmented_letters:
+        return text
+    if Counter(character for character in text if not character.isspace()) != Counter(
+        character for character in layout if not character.isspace()
+    ):
+        return text
+    # Some PDFs position each letter separately. The default extractor can add
+    # spaces inside words; use layout only when it repairs those spaces without
+    # dropping or duplicating any non-whitespace character, including rotated text.
+    return "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in layout.split("\n")).strip()
+
+
 def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     """Parse every physical page before returning any page evidence."""
 
@@ -114,7 +148,7 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
             raise ValueError("PDF requires a non-empty password")  # noqa: TRY003, TRY301 - Normalize parser failures below.
         pages: list[PDFPageInput] = []
         for page_number, page in enumerate(reader.pages, 1):
-            text = page.extract_text() or ""
+            text = _extract_page_text(page)
             text.encode("utf-8")
             pages.append(
                 PDFPageInput(
@@ -184,6 +218,22 @@ _FINANCIAL_TERMS = {
     "lawsuits": ("litigation", "legal", "proceedings"),
     "battles": ("litigation", "proceedings"),
 }
+# Derived metrics need the underlying statement line items, even when a report
+# never prints the metric's name. These definitions do not depend on an issuer.
+_FINANCIAL_CONCEPTS = (
+    (
+        r"\bcash conversion cycle\b",
+        ("inventory", "inventories", "receivable", "receivables", "payable", "payables", "revenue", "sales", "cost"),
+        ("balance", "income"),
+    ),
+    (r"\bcurrent ratio\b", ("current", "assets", "liabilities"), ("balance",)),
+    (r"\bworking capital\b", ("current", "assets", "liabilities"), ("balance",)),
+    (
+        r"\bfree cash flows?\b",
+        ("cash", "operating", "activities", "capital", "expenditures"),
+        ("cash",),
+    ),
+)
 # A question may ask whether a line item is absent from a named statement.
 # Matching only that line item's words cannot retrieve the required evidence.
 _STATEMENT_TOPICS = {
@@ -260,16 +310,29 @@ def _statement_intents(question: str) -> tuple[str, ...]:
     if re.search(r"\bebitda\b", normalized):
         # Operating earnings and D&A are often reported on different statements.
         topics.extend(("income", "cash"))
+    topics.extend(
+        topic
+        for pattern, _, concept_topics in _FINANCIAL_CONCEPTS
+        if re.search(pattern, normalized)
+        for topic in concept_topics
+    )
     return tuple(dict.fromkeys(topics))
 
 
 def _question_terms(question: str) -> tuple[str, ...]:
+    normalized = _normalize_question(question)
     terms = [
         term
-        for term in analyze_fts_query(_normalize_question(question)).split()
+        for term in analyze_fts_query(normalized).split()
         if term not in _QUESTION_WORDS and not (len(term) == 1 and term.isalpha())
     ]
     expanded = [alias for term in terms for alias in _FINANCIAL_TERMS.get(term, ())]
+    expanded.extend(
+        term
+        for pattern, concept_terms, _ in _FINANCIAL_CONCEPTS
+        if re.search(pattern, normalized)
+        for term in concept_terms
+    )
     statement_terms = [term for topic in _statement_intents(question) for term in _STATEMENT_TOPICS[topic][2]]
     return tuple(dict.fromkeys([*terms, *expanded, *statement_terms]))
 
@@ -287,8 +350,8 @@ def _page_statement_topics(text: str) -> dict[str, int]:
     return topics
 
 
-def _document_priority(text: str, question: str) -> int:
-    """Recognize a queried issuer from the projected document label."""
+def _document_priority(text: str, question: str) -> tuple[int, int]:
+    """Recognize a queried issuer and an explicitly requested report year."""
 
     label = text.partition("\n")[0]
     company = re.split(r"(?:19|20)\d{2}", label, maxsplit=1)[0]
@@ -302,7 +365,17 @@ def _document_priority(text: str, question: str) -> int:
         for start in range(len(words))
         for end in range(start + 1, min(len(words), start + width) + 1)
     }
-    return int(len(name) > 1 and name in names)
+    # A fiscal period in a question can be a comparison column in a later
+    # filing. Only explicit report wording identifies the requested document.
+    report = r"(?:annual\s+report|(?:form\s*)?10[\s-]?k)"
+    year = r"((?:19|20)\d{2})"
+    requested_years = {
+        match_[1]
+        for pattern in (rf"\b{year}\s+{report}\b", rf"\b{report}\s+(?:for\s+)?(?:fy\s*)?{year}\b")
+        for match_ in re.finditer(pattern, _normalize_question(question))
+    }
+    label_years = set(re.findall(r"(?:19|20)\d{2}", label))
+    return int(len(name) > 1 and name in names), int(bool(requested_years.intersection(label_years)))
 
 
 def _rank_pages(
@@ -318,7 +391,7 @@ def _rank_pages(
     average = sum(sum(tokens.values()) for tokens in tokenized) / count or 1
     frequency = Counter(term for tokens in tokenized for term in terms if term in tokens)
 
-    def rank(index: int) -> tuple[int, float, int]:
+    def rank(index: int) -> tuple[int, int, float, int]:
         tokens = tokenized[index]
         length = sum(tokens.values())
         score = 0.0
@@ -327,8 +400,8 @@ def _rank_pages(
             if tf:
                 idf = math.log1p((count - frequency[term] + 0.5) / (frequency[term] + 0.5))
                 score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length / average))
-        company = _document_priority(records[index].text, question)
-        return (-company, -score, index)
+        company, report_year = _document_priority(records[index].text, question)
+        return (-company, -report_year, -score, index)
 
     ranked = sorted(range(count), key=rank)
     intents = _statement_intents(question)
@@ -363,11 +436,21 @@ async def search_pdf_pages(
     if type(limit) is not int or limit < 1:
         raise ValueError("PDF search limit must be a positive integer")  # noqa: TRY003
     terms = _question_terms(question)
-    queries = tuple(dict.fromkeys((question, *terms)))
     # A fixed per-term top-80 pool can exclude every page of a named issuer
     # when other reports have shorter, repetitive pages. Size recall from the
     # real active Memory snapshot; all candidates still come from Memory.search.
-    candidate_limit = max(80, len((await memory.list()).entries), limit)
+    active = (await memory.list()).entries
+    candidate_limit = max(80, len(active), limit)
+    # Analyzer v1 preserves underscores in report labels. A search for the
+    # issuer alone cannot match that label on a page with no issuer in its body.
+    # Retrieve it by the exact stored label, then rank only real search hits.
+    document_queries = (
+        record.entry.text.partition("\n")[0]
+        for record in active
+        if _document_priority(record.entry.text, question)[0]
+        and any(source.source_type == "pdf-page" for source in record.entry.sources)
+    )
+    queries = tuple(dict.fromkeys((question, *terms, *document_queries)))
     hits: dict[tuple[str, str, int, str, str], MemoryHit] = {}
     for query in queries:
         result = await memory.search(SearchMemoryRequest(query=query, limit=candidate_limit, mode="fts"))

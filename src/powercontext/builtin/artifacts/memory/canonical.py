@@ -31,6 +31,8 @@ from powercontext.builtin.artifacts.memory.models import MemoryContent
 _ENTRY_HASH_DOMAIN = b"powercontext:entry-content:v1\0"
 _EMBEDDING_HASH_DOMAIN = b"powercontext:embedding-content:v1\0"
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+MAX_MEMORY_TEXT_BYTES = 8192
+MAX_CAPTURED_PAGE_TEXT_BYTES = 1_048_576
 
 
 class _CanonicalValueError(ValueError):
@@ -38,6 +40,7 @@ class _CanonicalValueError(ValueError):
         self.code = code
         messages = {
             "text-too-long": "memory entry text must not exceed 8192 UTF-8 bytes",
+            "captured-page-text-too-long": "captured PDF page text must not exceed 1048576 UTF-8 bytes",
             "reason-too-long": "memory change reason must not exceed 512 Unicode code points",
             "identifier-empty": "memory identifiers must be non-empty strings",
             "identifier-ascii": "memory identifiers must contain only ASCII characters",
@@ -82,8 +85,26 @@ def normalize_text(value: str) -> str:
     """Normalize and validate one durable entry body."""
 
     normalized = _normalize_non_empty_string(value, "memory entry text")
-    if len(normalized.encode("utf-8")) > 8192:
+    if len(normalized.encode("utf-8")) > MAX_MEMORY_TEXT_BYTES:
         raise _CanonicalValueError("text-too-long")
+    return normalized
+
+
+def normalize_entry_text(value: str, *, source_refs: Sequence[object]) -> str:
+    """Normalize an entry, retaining complete captured PDF page evidence.
+
+    Ordinary bodies retain their 8 KiB bound. A PDF reference permits the bounded
+    representation needed to hash and read complete captured pages; the service
+    additionally verifies that a long write equals its authoritative projection.
+    This decision depends on immutable content, so readback and projection rebuilds
+    apply the same policy without needing a live Source catalog.
+    """
+
+    if not any(isinstance(ref, Mapping) and ref.get("source_type") == "pdf-page" for ref in source_refs):
+        return normalize_text(value)
+    normalized = _normalize_non_empty_string(value, "memory entry text")
+    if len(normalized.encode("utf-8")) > MAX_CAPTURED_PAGE_TEXT_BYTES:
+        raise _CanonicalValueError("captured-page-text-too-long")
     return normalized
 
 
@@ -160,7 +181,7 @@ def entry_content_bytes(
 
     return canonical_json({
         "kind": normalize_kind(kind),
-        "text": normalize_text(text),
+        "text": normalize_entry_text(text, source_refs=source_refs),
         "source_refs": normalize_refs(source_refs),
         "artifact_refs": normalize_refs(artifact_refs),
     })

@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from powercontext._logging import log_safely
 from powercontext.artifacts import Artifact, ArtifactLineage, ArtifactRef
 from powercontext.builtin.artifacts.memory.canonical import (
+    MAX_MEMORY_TEXT_BYTES,
     canonical_embedding,
     canonical_error_code,
     canonical_json,
@@ -37,10 +38,10 @@ from powercontext.builtin.artifacts.memory.canonical import (
     entry_content_bytes,
     entry_content_hash,
     memory_content_bytes,
+    normalize_entry_text,
     normalize_kind,
     normalize_query,
     normalize_reason,
-    normalize_text,
     validate_identifier,
 )
 from powercontext.builtin.artifacts.memory.errors import (
@@ -112,6 +113,7 @@ from powercontext.errors import RevisionConflictError
 from powercontext.sources import (
     TEXT_EVIDENCE_PROJECTION_KEY,
     Source,
+    SourceMaterialization,
     SourceObservation,
     SourceProjectionKey,
     SourceRef,
@@ -1654,7 +1656,7 @@ class MemoryService:
             sources = (*previous.sources, *candidate_source_refs)
             artifacts = (*previous.artifacts, *candidate_artifacts)
         try:
-            return self._entry_material(
+            material = self._entry_material(
                 kind=candidate.kind,
                 text=candidate.text,
                 sources=sources,
@@ -1666,6 +1668,49 @@ class MemoryService:
                 str(error),
                 canonical_code=canonical_error_code(error),
             ) from error
+        await self._validate_captured_page_text(material, candidate_sources, previous)
+        return material
+
+    async def _validate_captured_page_text(
+        self,
+        material: _EntryMaterial,
+        candidate_sources: Sequence[Source],
+        previous: MemoryEntryVersion | None,
+    ) -> None:
+        if len(material.text.encode("utf-8")) <= MAX_MEMORY_TEXT_BYTES:
+            return
+        # A generated summary cannot evade the ordinary body bound by attaching
+        # a PDF reference. The exception is only the complete, captured projection.
+        sources = list(candidate_sources)
+        resolver = self._source_resolver
+        if resolver is not None and previous is not None:
+            supplied = {(ref.source_type, ref.source_id) for ref in self._source_refs(candidate_sources)}
+            for ref in previous.sources:
+                if ref.source_type == "pdf-page" and (ref.source_type, ref.source_id) not in supplied:
+                    sources.append(await resolver.get_ref(ref))
+        for source in sources:
+            if source.materialization is not SourceMaterialization.CAPTURED or resolver is None:
+                continue
+            ref = resolver.as_ref(source)
+            if ref.source_type != "pdf-page" or ref not in material.sources:
+                continue
+            try:
+                projection = (
+                    source.projection(TEXT_EVIDENCE_PROJECTION_KEY)
+                    if isinstance(source, SourceObservation)
+                    else resolver.project(source, TEXT_EVIDENCE_PROJECTION_KEY)
+                )
+                evidence = TextEvidence.model_validate(projection)
+                text = normalize_entry_text(evidence.content, source_refs=(ref.model_dump(mode="json"),))
+            except (KeyError, LookupError, TypeError, ValueError):
+                continue
+            if text == material.text and (evidence.source_type, evidence.source_id) == (ref.source_type, ref.source_id):
+                return
+        raise InvalidMemoryCandidateError(
+            "canonical",
+            "long PDF entry text must equal its complete captured page evidence",
+            canonical_code="captured-page-text-mismatch",
+        )
 
     async def _canonical_candidate_sources(
         self,
@@ -1717,10 +1762,10 @@ class MemoryService:
         artifacts: Sequence[ArtifactRef],
     ) -> _EntryMaterial:
         normalized_kind = normalize_kind(kind)
-        normalized_text = normalize_text(text)
         canonical_sources = _canonical_source_refs(sources)
         canonical_artifacts = _canonical_artifact_refs(artifacts)
         source_refs = tuple(source.model_dump(mode="json") for source in canonical_sources)
+        normalized_text = normalize_entry_text(text, source_refs=source_refs)
         artifact_refs = tuple(artifact.model_dump(mode="json") for artifact in canonical_artifacts)
         content_bytes = entry_content_bytes(
             kind=normalized_kind,
@@ -1824,7 +1869,7 @@ def _raise_if_write_held(plan: MemoryWritePlan) -> None:
 
 
 def _bounded_gate_evidence(identity: str, content: str) -> _GateEvidenceEntry:
-    normalized = normalize_text(content)
+    normalized = normalize_query(content)
     return _GateEvidenceEntry(
         text=f"{identity}\n{normalized[:_GATE_EVIDENCE_TEXT_LIMIT]}",
         complete=len(normalized) <= _GATE_EVIDENCE_TEXT_LIMIT,

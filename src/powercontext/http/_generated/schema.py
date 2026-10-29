@@ -8479,7 +8479,41 @@ OPENAPI_SCHEMA: dict[str, JsonValue] = {
                     "text": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Must not exceed 8192 UTF-8 bytes after normalization.",
+                        "description": "Ordinary "
+                        "entry "
+                        "text "
+                        "must "
+                        "not "
+                        "exceed "
+                        "8192 "
+                        "UTF-8 "
+                        "bytes "
+                        "after "
+                        "normalization. "
+                        "An "
+                        "exact "
+                        "complete "
+                        "captured "
+                        "pdf-page "
+                        "projection "
+                        "may "
+                        "contain "
+                        "up "
+                        "to "
+                        "1048576 "
+                        "UTF-8 "
+                        "bytes, "
+                        "including "
+                        "its "
+                        "document "
+                        "identifier; "
+                        "its "
+                        "authoritative "
+                        "source "
+                        "evidence "
+                        "must "
+                        "be "
+                        "retained.",
                     },
                     "reason": {"type": "string", "maxLength": 512, "nullable": True},
                 },

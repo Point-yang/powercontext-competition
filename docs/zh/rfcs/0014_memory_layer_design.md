@@ -492,6 +492,10 @@ MemoryEntryInput:
 `text` 经 NFC 和首尾空白规范化后必须非空，UTF-8 编码不得超过 8192 bytes；该上限同时保证 OceanBase `TEXT` 全文列
 可以容纳 analyzer v1 的派生 tokens。
 
+完整的 `pdf-page` captured 证据允许保留至多 1,048,576 个 UTF-8 字节，包含文档标识符。正文超过普通上限时，
+必须在相同规范化后等于一个已校验 captured PDF Source 的标准文本投影；给无关生成正文附上 PDF 引用不能放宽长度。
+Canonical hash、精确读取与投影重建根据不可变来源引用应用同一策略；普通 entry 的上限和已有短正文的 canonical 编码保持不变。
+
 ## remember()
 
 ```python

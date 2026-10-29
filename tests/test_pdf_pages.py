@@ -259,3 +259,102 @@ def test_requested_statements_survive_repetitive_notes_and_cover_multiple_eviden
                 assert len({(citation.entry_id, citation.entry_version_id) for citation in citations}) == limit
 
     asyncio.run(scenario())
+
+
+def test_explicit_report_year_selects_issuer_revision_without_treating_every_fiscal_year_as_filing_year(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
+        inputs = (
+            ("NORTH_2025_10K", ("Consolidated Statements of Income\nOperating income 70 in fiscal 2024.",)),
+            (
+                "NORTH_2024_10K",
+                tuple(
+                    "Consolidated Statements of Income\nOperating income NORTH 2025 annual report 60."
+                    for _ in range(25)
+                ),
+            ),
+            ("SOUTH_2025_10K", ("Warranty accruals changed by 90 in 2024.",)),
+            ("SOUTH_2024_10K", ("Other operating income 2024.",)),
+        )
+        observations = []
+        for document_id, texts in inputs:
+            for page in parse_pdf_document(PDFDocumentInput(document_id=document_id, content=pdf_bytes(texts))):
+                observations.append(project_source_for_transport(registry, await registry.resolve(page)))
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'report-years.db'}"))
+        async with open_builtin_runtime(config, candidate_pipeline=_EvidencePipeline()) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Annual reports", summary="Distinct filing years", idempotency_key="report-years")
+            )
+            await runtime.ingestion.register(manifest_for_definition(PDF_PAGE_SOURCE_DEFINITION))
+            for observation in observations:
+                await runtime.ingestion.submit(
+                    SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
+                )
+            memory = runtime.memory.for_scope(scope.scope_id)
+            for _ in range(len(observations) + 1):
+                if not (await memory.flush()).processed:
+                    break
+            for question in (
+                "According to NORTH's 2025 annual report, what is its operating income?",
+                "According to NORTH's annual report for 2025, what is its operating income in FY2024?",
+                "According to NORTH's 2025 Form 10-K, what is its operating income?",
+            ):
+                citations = await search_pdf_pages(memory, question, limit=20)
+                entries = [(await memory.get(GetMemoryEntryRequest(citation=citation))).entry for citation in citations]
+                assert entries[0].sources[0].source_id == observations[0].name
+            citations = await search_pdf_pages(
+                memory, "What was SOUTH's change in warranty accruals for FY2024?", limit=1
+            )
+            entry = (await memory.get(GetMemoryEntryRequest(citation=citations[0]))).entry
+            assert entry.text.startswith("SOUTH_2025_10K\nWarranty accruals")
+
+    asyncio.run(scenario())
+
+
+def test_financial_metric_questions_recall_component_statements_without_literal_metric_names(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
+        pages = parse_pdf_document(
+            PDFDocumentInput(
+                document_id="SOUTH_2025_10K",
+                content=pdf_bytes((
+                    "Consolidated Balance Sheets\nInventory 91. Accounts receivable 200. Accounts payable 80. "
+                    "Current assets 400. Current liabilities 160.",
+                    "Consolidated Statements of Income\nNet revenue 900. Cost of sales 500.",
+                    "Consolidated Statements of Cash Flows\nNet cash provided by operating activities 70. "
+                    "Capital expenditures 30.",
+                )),
+            )
+        )
+        observations = [project_source_for_transport(registry, await registry.resolve(page)) for page in pages]
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'financial-metrics.db'}"))
+        async with open_builtin_runtime(config, candidate_pipeline=_EvidencePipeline()) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(
+                    title="Financial metrics", summary="Underlying statement evidence", idempotency_key="metrics"
+                )
+            )
+            await runtime.ingestion.register(manifest_for_definition(PDF_PAGE_SOURCE_DEFINITION))
+            for observation in observations:
+                await runtime.ingestion.submit(
+                    SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
+                )
+            memory = runtime.memory.for_scope(scope.scope_id)
+            for _ in range(len(observations) + 1):
+                if not (await memory.flush()).processed:
+                    break
+            for question, expected in (
+                ("What is SOUTH's cash conversion cycle?", {o.name for o in observations[:2]}),
+                ("Calculate SOUTH's current ratio.", {observations[0].name}),
+                ("What is SOUTH's working capital?", {observations[0].name}),
+                ("What is SOUTH's free cash flow?", {observations[2].name}),
+            ):
+                citations = await search_pdf_pages(memory, question, limit=20)
+                entries = [(await memory.get(GetMemoryEntryRequest(citation=citation))).entry for citation in citations]
+                assert expected <= {source.source_id for entry in entries for source in entry.sources}
+
+    asyncio.run(scenario())
