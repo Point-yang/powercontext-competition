@@ -22,6 +22,7 @@ import json
 import math
 import re
 import unicodedata
+import zlib
 from collections import Counter
 from typing import TYPE_CHECKING, Literal
 
@@ -36,6 +37,7 @@ from powercontext.sources.projections import TEXT_EVIDENCE_PROJECTION_KEY, TextE
 
 if TYPE_CHECKING:
     from pypdf import PageObject
+    from pypdf.generic import PdfObject, StreamObject
 
     from powercontext.builtin.runtime.application import ScopedMemoryApplication
 
@@ -134,6 +136,126 @@ def _extract_page_text(page: PageObject) -> str:
     return "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in layout.split("\n")).strip()
 
 
+def _validate_flate_payload(data: bytes) -> None:
+    from pypdf import get_configuration
+
+    # pypdf deliberately recovers malformed Flate data, sometimes returning an
+    # empty or partial body. Check the end marker without retaining its output.
+    decoder = zlib.decompressobj()
+    limit = get_configuration().zlib_maximum_output_length
+    decoded_length = 0
+    remaining = data
+    while True:
+        chunk = decoder.decompress(remaining, max_length=65536)
+        decoded_length += len(chunk)
+        if limit and decoded_length > limit:
+            raise ValueError("PDF content exceeds the configured decompression limit")  # noqa: TRY003
+        if decoder.eof:
+            return
+        remaining = decoder.unconsumed_tail
+        if not remaining and not chunk:
+            raise ValueError("PDF compressed text stream is incomplete")  # noqa: TRY003
+
+
+def _validate_stream_compression(stream: StreamObject) -> None:
+    from pypdf.filters import decode_stream_data
+    from pypdf.generic import ArrayObject, NameObject, NullObject, StreamObject
+
+    filters = stream.get("/Filter")
+    if filters is None:
+        return
+    filters = filters.get_object()
+    filter_names = tuple(filters) if isinstance(filters, ArrayObject) else (filters,)
+    parameters = stream.get("/DecodeParms")
+    if parameters is not None:
+        parameters = parameters.get_object()
+        if isinstance(parameters, ArrayObject):
+            if len(parameters) != len(filter_names):
+                raise ValueError("PDF filter parameters must match its filters")  # noqa: TRY003
+        elif not isinstance(parameters, NullObject) and len(filter_names) != 1:
+            raise ValueError("PDF filter parameters must match its filters")  # noqa: TRY003
+    # The base method returns encoded bytes, rather than the subclass's
+    # recovering decoder. The fixed pypdf API keeps both representations.
+    raw = StreamObject.get_data(stream)
+    for index, filter_name in enumerate(filter_names):
+        if filter_name.get_object() not in {"/FlateDecode", "/Fl"}:
+            continue
+        data = raw
+        if index:
+            prefix = StreamObject()
+            prefix.update(stream)
+            prefix.set_data(raw)
+            prefix[NameObject("/Filter")] = ArrayObject(filter_names[:index])
+            if isinstance(parameters, ArrayObject):
+                prefix[NameObject("/DecodeParms")] = ArrayObject(parameters[:index])
+            data = decode_stream_data(prefix)
+        _validate_flate_payload(data)
+
+
+def _validate_content_streams(value: PdfObject | None, checked: set[int]) -> None:
+    from pypdf.generic import ArrayObject, NullObject, StreamObject
+
+    if value is None:
+        return
+    value = value.get_object()
+    if isinstance(value, NullObject):
+        return
+    if isinstance(value, ArrayObject):
+        for member in value:
+            _validate_content_streams(member, checked)
+        return
+    if not isinstance(value, StreamObject):
+        raise TypeError("PDF page contents must contain only streams")  # noqa: TRY003
+    if id(value) not in checked:
+        checked.add(id(value))
+        _validate_stream_compression(value)
+
+
+def _validate_font_maps(fonts: PdfObject | None, checked: set[int]) -> None:
+    from pypdf.generic import DictionaryObject, StreamObject
+
+    if fonts is None:
+        return
+    fonts = fonts.get_object()
+    if not isinstance(fonts, DictionaryObject):
+        return
+    for reference in fonts.values():
+        font = reference.get_object()
+        if not isinstance(font, DictionaryObject):
+            continue
+        mapping = font.get("/ToUnicode")
+        if mapping is not None and isinstance(mapping.get_object(), StreamObject):
+            # A recovering character-map decode silently changes glyphs.
+            # Validate only actual mapping streams, not named/null CMaps
+            # or binary font programs unrelated to text extraction.
+            _validate_content_streams(mapping, checked)
+
+
+def _validate_text_resources(resources: PdfObject | None, checked: set[int]) -> None:
+    from pypdf.generic import DictionaryObject, NullObject, StreamObject
+
+    if resources is None:
+        return
+    resources = resources.get_object()
+    if isinstance(resources, NullObject) or id(resources) in checked:
+        return
+    if not isinstance(resources, DictionaryObject):
+        raise TypeError("PDF text resources must be a dictionary")  # noqa: TRY003
+    checked.add(id(resources))
+    _validate_font_maps(resources.get("/Font"), checked)
+    objects = resources.get("/XObject")
+    if objects is None:
+        return
+    objects = objects.get_object()
+    if not isinstance(objects, DictionaryObject):
+        raise TypeError("PDF XObject resources must be a dictionary")  # noqa: TRY003
+    for reference in objects.values():
+        form = reference.get_object()
+        if isinstance(form, StreamObject) and form.get("/Subtype") == "/Form" and id(form) not in checked:
+            _validate_content_streams(form, checked)
+            _validate_text_resources(form.get("/Resources", resources), checked)
+
+
 def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     """Parse every physical page before returning any page evidence."""
 
@@ -148,7 +270,10 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
         if reader.is_encrypted and not reader.decrypt(""):
             raise ValueError("PDF requires a non-empty password")  # noqa: TRY003, TRY301 - Normalize parser failures below.
         pages: list[PDFPageInput] = []
+        checked_streams: set[int] = set()
         for page_number, page in enumerate(reader.pages, 1):
+            _validate_content_streams(page.get("/Contents"), checked_streams)
+            _validate_text_resources(page.get("/Resources"), checked_streams)
             # Memory stores NFC text. Normalize before the captured projection is
             # created so its exact page body survives persistence unchanged.
             text = unicodedata.normalize("NFC", _extract_page_text(page))
@@ -258,6 +383,13 @@ _STATEMENT_TOPICS = {
         r"(?:balance sheets?|statements? of financial (?:position|condition))",
         ("balance", "sheet", "financial", "position", "condition"),
     ),
+    "equity": (
+        r"statements? of (?:changes in )?(?:(?:shareholders?|stockholders?)['’]? )?equity|"  # noqa: RUF001
+        r"(?:shareholders?|stockholders?)['’]? equity statements?",  # noqa: RUF001
+        r"(?:statements? of (?:changes in )?(?:(?:shareholders?|stockholders?)['’]? )?equity|"  # noqa: RUF001
+        r"(?:shareholders?|stockholders?)['’]? equity)",  # noqa: RUF001
+        ("equity", "shareholders", "stockholders"),
+    ),
 }
 _STATEMENT_HEADINGS = {
     name: re.compile(
@@ -299,6 +431,15 @@ _QUESTION_WORDS = frozenset({
     "important",
     "materially",
 })
+_QUANTITATIVE_QUESTION = re.compile(r"\b(?:how (?:much|many)|what (?:is|was|are|were)|calculate|compute|quantify)\b")
+_FINANCIAL_QUANTITY = re.compile(
+    r"\b(?:cash|capital|stocks?|shares?|equity|assets?|liabilit(?:y|ies)|debts?|income|revenues?|profits?|"
+    r"earnings|expenses?|dividends?|interest|margins?|ratios?|turnover|returns?|costs?|roe|roa|roic|dpo|dso|dio|ccc)\b"
+)
+_QUALITATIVE_QUESTION = re.compile(
+    r"\b(?:why|where|describe|geograph\w*|risks?|polic(?:y|ies)|strateg(?:y|ies)|purpose|legal|battles|"
+    r"litigation|proceedings|settlements?)\b"
+)
 
 
 def _normalize_question(question: str) -> str:
@@ -322,7 +463,20 @@ def _statement_intents(question: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(topics))
 
 
-def _question_terms(question: str) -> tuple[str, ...]:
+def _quantitative_statement_intents(question: str) -> tuple[str, ...]:
+    normalized = _normalize_question(question)
+    if (
+        _QUANTITATIVE_QUESTION.search(normalized)
+        and _FINANCIAL_QUANTITY.search(normalized)
+        and not _QUALITATIVE_QUESTION.search(normalized)
+    ):
+        # A derived metric need not occur literally in a report. Keep limited
+        # coverage of its primary financial statements without guessing a formula.
+        return tuple(_STATEMENT_TOPICS)
+    return ()
+
+
+def _semantic_terms(question: str) -> tuple[str, ...]:
     normalized = _normalize_question(question)
     terms = [
         term
@@ -336,8 +490,14 @@ def _question_terms(question: str) -> tuple[str, ...]:
         if re.search(pattern, normalized)
         for term in concept_terms
     )
-    statement_terms = [term for topic in _statement_intents(question) for term in _STATEMENT_TOPICS[topic][2]]
-    return tuple(dict.fromkeys([*terms, *expanded, *statement_terms]))
+    return tuple(dict.fromkeys([*terms, *expanded]))
+
+
+def _question_terms(question: str) -> tuple[str, ...]:
+    terms = _semantic_terms(question)
+    intents = _statement_intents(question) or _quantitative_statement_intents(question)
+    statement_terms = [term for topic in intents for term in _STATEMENT_TOPICS[topic][2]]
+    return tuple(dict.fromkeys([*terms, *statement_terms]))
 
 
 def _page_statement_topics(text: str) -> dict[str, int]:
@@ -382,7 +542,7 @@ def _document_priority(text: str, question: str) -> tuple[int, int]:
 
 
 def _rank_pages(
-    hits: dict[tuple[str, str, int, str, str], MemoryHit], terms: tuple[str, ...], question: str
+    hits: dict[tuple[str, str, int, str, str], MemoryHit], terms: tuple[str, ...], question: str, limit: int
 ) -> list[MemoryHit]:
     records = list(hits.values())
     # Use the same alphanumeric/Unicode terms as the query and the Memory index.
@@ -391,14 +551,20 @@ def _rank_pages(
     count = len(records)
     if not count:
         return []
+    intents = _statement_intents(question)
+    explicit = bool(intents)
+    if not intents:
+        intents = _quantitative_statement_intents(question)
+    # Generic titles are recall probes, not extra subjects of the question.
+    ranking_terms = _semantic_terms(question) if intents and not explicit else terms
     average = sum(sum(tokens.values()) for tokens in tokenized) / count or 1
-    frequency = Counter(term for tokens in tokenized for term in terms if term in tokens)
+    frequency = Counter(term for tokens in tokenized for term in ranking_terms if term in tokens)
 
-    def rank(index: int) -> tuple[int, int, float, int]:
+    def rank(index: int, query_terms: tuple[str, ...] = ranking_terms) -> tuple[int, int, float, int]:
         tokens = tokenized[index]
         length = sum(tokens.values())
         score = 0.0
-        for term in terms:
+        for term in query_terms:
             tf = tokens[term]
             if tf:
                 idf = math.log1p((count - frequency[term] + 0.5) / (frequency[term] + 0.5))
@@ -407,7 +573,6 @@ def _rank_pages(
         return (-company, -report_year, -score, index)
 
     ranked = sorted(range(count), key=rank)
-    intents = _statement_intents(question)
     if not intents:
         return [records[index] for index in ranked]
     best_company = _document_priority(records[ranked[0]].text, question)
@@ -421,10 +586,29 @@ def _rank_pages(
         ]
         if eligible:
             confidence = max(statement_pages[index][topic] for index in eligible)
-            by_topic.append([index for index in eligible if statement_pages[index][topic] == confidence][:2])
-    # Reserve both requested statements before taking a second continuation page.
-    # The rest of the result retains the original lexical ranking and evidence.
-    reserved = list(dict.fromkeys(pages[round_] for round_ in range(2) for pages in by_topic if len(pages) > round_))
+            by_topic.append([index for index in eligible if statement_pages[index][topic] == confidence])
+    if explicit:
+        budget = min(limit, max(len(intents), limit // 2))
+    else:
+        # General quantitative coverage reserves one page per statement type;
+        # all other positions retain lexical evidence, including detailed notes.
+        budget = min(limit, len(intents))
+        original_terms = set(analyze_fts_query(_normalize_question(question)).split())
+        focus_terms = tuple(term for term in terms if term in original_terms)
+        # Retrieval expansions find alternative titles; they must not outweigh
+        # the user's actual subject when selecting a representative statement.
+        by_topic = [sorted(pages, key=lambda index: rank(index, focus_terms))[:1] for pages in by_topic]
+        by_topic.sort(key=lambda pages: rank(pages[0], focus_terms))
+    reserved = list(
+        dict.fromkeys(
+            candidates[round_]
+            for round_ in range(max(map(len, by_topic), default=0))
+            for candidates in by_topic
+            if len(candidates) > round_
+        )
+    )[:budget]
+    # Requested statement types get a turn before any receives a continuation.
+    # Remaining positions retain the original lexical ranking and evidence.
     reserved_set = set(reserved)
     return [records[index] for index in (*reserved, *(index for index in ranked if index not in reserved_set))]
 
@@ -468,7 +652,7 @@ async def search_pdf_pages(
             hits.setdefault(identity, hit)
     citations: list[MemoryCitation] = []
     pages: set[tuple[str, str]] = set()
-    for hit in _rank_pages(hits, terms, question):
+    for hit in _rank_pages(hits, terms, question, limit):
         citation = MemoryCitation(
             memory_ref=hit.memory_ref, entry_id=hit.entry_id, entry_version_id=hit.entry_version_id
         )

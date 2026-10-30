@@ -358,3 +358,129 @@ def test_financial_metric_questions_recall_component_statements_without_literal_
                 assert expected <= {source.source_id for entry in entries for source in entry.sources}
 
     asyncio.run(scenario())
+
+
+async def _search_complete_report_pages(
+    tmp_path: Path, texts: tuple[str, ...], questions: tuple[tuple[str, int], ...]
+) -> list[tuple[int, ...]]:
+    registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
+    pages = parse_pdf_document(PDFDocumentInput(document_id="OMEGA_2025_10K", content=pdf_bytes(texts)))
+    observations = [project_source_for_transport(registry, await registry.resolve(page)) for page in pages]
+    page_by_source = {observation.name: page.page_number for observation, page in zip(observations, pages, strict=True)}
+    config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'statement-coverage.db'}"))
+    async with open_builtin_runtime(config, candidate_pipeline=_EvidencePipeline()) as runtime:
+        assert runtime.scopes is not None
+        scope = await runtime.scopes.create(
+            ScopeDraft(title="Statements", summary="Complete page coverage", idempotency_key="statement-coverage")
+        )
+        await runtime.ingestion.register(manifest_for_definition(PDF_PAGE_SOURCE_DEFINITION))
+        for observation in observations:
+            await runtime.ingestion.submit(SubmitSourceObservation(scope_id=scope.scope_id, observation=observation))
+        memory = runtime.memory.for_scope(scope.scope_id)
+        for _ in range(len(observations) + 1):
+            if not (await memory.flush()).processed:
+                break
+    results = []
+    async with open_builtin_runtime(config) as runtime:
+        memory = runtime.memory.for_scope(scope.scope_id)
+        for question, limit in questions:
+            citations = await search_pdf_pages(memory, question, limit=limit)
+            entries = [(await memory.get(GetMemoryEntryRequest(citation=citation))).entry for citation in citations]
+            numbers = tuple(page_by_source[entry.sources[0].source_id] for entry in entries)
+            assert len(numbers) == len(set(numbers)) <= limit
+            results.append(numbers)
+    return results
+
+
+def test_cash_flow_continuations_are_not_limited_to_two_pages(tmp_path: Path) -> None:
+    texts = (
+        "Consolidated Statement of Cash Flows\nNet cash from operating activities 100.",
+        "Consolidated Statement of Cash Flows\nFree cash from operating activities 200. "
+        "Operating activities capital expenditures reference.",
+        "Consolidated Statement of Cash Flows\nPurchases of property plant and equipment 23.",
+        *(
+            f"Note {index}\n" + "Free cash flow operating activities capital expenditures cash flows 2025. " * 8
+            for index in range(25)
+        ),
+    )
+    results = asyncio.run(
+        _search_complete_report_pages(
+            tmp_path,
+            texts,
+            (("What is OMEGA free cash flow for FY2025?", 20), ("What is OMEGA free cash flow for FY2025?", 1)),
+        )
+    )
+    assert {1, 2, 3} <= set(results[0])
+    assert len(results[0]) == 20
+    assert len(results[1]) == 1
+
+
+def test_quantitative_financial_questions_cover_statements_without_named_metric_templates(tmp_path: Path) -> None:
+    texts = (
+        "Consolidated Statements of Income\nRevenue 900. Cost of sales 500. Earnings 70.",
+        "Consolidated Balance Sheets\nAssets 800. Liabilities 300. Equity 500. Accounts payable 80.",
+        "Consolidated Statements of Cash Flows\nPayment to acquire common stock 70. "
+        "Purchases of property plant and equipment 23.",
+        "Consolidated Statements of Shareholders Equity\nCommon shares acquired for treasury 70.",
+        "Geographic segments\nOMEGA geographies: North America Europe Asia. Countries and operations worldwide.",
+        "Legal proceedings\nOMEGA reported materially important ongoing legal battles in 2025 and 2024. "
+        "Legal risks related to cash payments include litigation.",
+        *(
+            f"Note {index}\n" + "How much cash OMEGA stock buybacks 2025 capital intensity revenue. " * 8
+            for index in range(25)
+        ),
+    )
+    questions = (
+        ("How much cash did OMEGA use for stock buybacks in FY2025?", 20),
+        ("What was OMEGA capital intensity in FY2025?", 20),
+        ("Calculate OMEGA ROE for FY2025.", 20),
+        ("What was OMEGA DPO in FY2025?", 20),
+        ("What are the geographies that OMEGA primarily operates in as of FY2025?", 1),
+        ("Has OMEGA reported any materially important ongoing legal battles from FY2025 and FY2024?", 1),
+        ("What are OMEGA's legal risks related to cash payments?", 1),
+        ("How much cash did OMEGA use for stock buybacks in FY2025?", 2),
+        ("How much cash did OMEGA use for stock buybacks in FY2025?", 1),
+    )
+    results = asyncio.run(_search_complete_report_pages(tmp_path, texts, questions))
+    assert {3, 4} <= set(results[0])
+    assert {1, 3} <= set(results[1])
+    assert {1, 2} <= set(results[2])
+    assert {1, 2} <= set(results[3])
+    assert results[4] == (5,)
+    assert results[5] == results[6] == (6,)
+    assert len(results[7]) == 2
+    assert 3 in results[7]
+    assert results[8] == (3,)
+
+
+def test_statement_lookup_words_do_not_displace_literal_quarterly_repurchase_evidence(tmp_path: Path) -> None:
+    lookup_groups = (
+        "income operations earnings",
+        "balance sheet financial condition",
+        "financial position equity",
+        "equity shareholders stockholders",
+        "income cash flows",
+    )
+    texts = (
+        "Consolidated Statements of Income\nRevenue 900. Cost of sales 500. Earnings 70.",
+        "Consolidated Balance Sheets\nAssets 800. Liabilities 300. Equity 500.",
+        "Consolidated Statements of Cash Flows\nPayment to acquire common stock 70.",
+        "Consolidated Statements of Shareholders Equity\nCommon shares acquired for treasury 70.",
+        "Quarterly repurchases of common stock\nQuarter ended March: stock buybacks paid in cash 90. "
+        "Quarter ended June: stock buybacks paid in cash 80. "
+        "Quarter ended September: stock buybacks paid in cash 70.",
+        *(
+            f"Note {index}\n"
+            + (lookup_groups[index % len(lookup_groups)] + " ") * 30
+            + "Cash stock buybacks quarter ended 2025."
+            for index in range(25)
+        ),
+    )
+    results = asyncio.run(
+        _search_complete_report_pages(
+            tmp_path,
+            texts,
+            (("How much cash did OMEGA use for stock buybacks in the quarter ended FY2025?", 20),),
+        )
+    )
+    assert {3, 5} <= set(results[0])
